@@ -1,637 +1,386 @@
-# TorchTitan Codebase Walkthrough
+# Codebase walkthrough
 
-A guided reading order for understanding this distributed LLM training framework.
-Read files in the order presented — each section builds on the previous one.
+A reading guide for the MoE training codebase. Follow in order, or jump around —
+each section is self-contained.
 
----
+## 0. The 30-second version
 
-## Reading Order Overview
+You run `torchrun --nproc_per_node=4 train.py --config configs/moe_tiny.yaml`.
+That loads a YAML → pydantic `Config` → calls `src.trainer.train(cfg)`, which
+builds a MoE transformer with FSDP2 + Expert Parallel, iterates over a
+pre-tokenized local dataset, computes cross-entropy loss, and writes
+checkpoints. Everything is on a single file path from top to bottom.
 
-```
-1. Entry Point        run_train.sh → train.py
-2. Configuration      config/job_config.py → config/manager.py
-3. Model Protocol     protocols/model.py → protocols/train_spec.py
-4. A Concrete Model   models/llama3/__init__.py → args.py → model_def.py
-5. Data Pipeline      hf_datasets/text_datasets.py → components/dataloader.py → components/tokenizer.py
-6. Loss & Optimization components/loss.py → components/optimizer.py → components/lr_scheduler.py
-7. Training Loop      train.py (re-read with full context)
-8. Metrics & Logging  components/metrics.py → tools/logging.py
-9. Checkpointing      components/checkpoint.py → protocols/state_dict_adapter.py
-10. Validation        components/validate.py
-11. Parallelism       distributed/parallel_dims.py → distributed/utils.py
-12. MoE               models/moe/moe.py → models/deepseek_v3/__init__.py
-```
-
----
-
-## 1. Entry Point
-
-### `run_train.sh`
-The shell script that launches training. Read this first to understand how the system starts.
+## 1. Entry point and top-level layout
 
 ```
-User runs ./run_train.sh
-  → sets NGPU, CONFIG_FILE, LOG_RANK
-  → if COMM_MODE set: runs single-process debug mode (fake_backend or local_tensor)
-  → else: runs torchrun with NCCL for real distributed training
-  → invokes: python -m torchtitan.train
+train.py                ← CLI shell (typer); just loads YAML and calls train()
+config.py (src/config/) ← pydantic user-facing config
+src/trainer.py          ← the actual training loop
+src/data.py             ← dataset + dataloader
+src/models/moe/model.py ← the MoE Transformer (Attention, RMSNorm, Block, Model)
+src/models/parallelize.py ← applies EP and FSDP to the model
+src/components/         ← optimizer, lr_scheduler, tokenizer, checkpoint (from torchtitan)
+src/distributed/        ← ParallelDims, ExpertParallel, activation_checkpoint (from torchtitan)
+src/logging.py          ← logfire console + stdlib FileHandler
+src/utils.py            ← GarbageCollection, has_cuda_capability, device_type helpers
 ```
 
-**Key env vars:**
-- `NGPU` — number of GPUs (default 8)
-- `CONFIG_FILE` — path to TOML config file
-- `COMM_MODE` — `fake_backend` for dry-run, `local_tensor` for single-GPU simulation
+The `components/` and `distributed/` directories are TorchTitan code we kept
+intact — everything else is our own.
 
-### `torchtitan/train.py` (first pass — just read `main()` at the bottom)
-Skip the `Trainer` class for now. Start at the bottom:
+## 2. train.py → src/trainer.py
+
+Start here: [`train.py`](train.py)
 
 ```python
-def main(trainer_class):
-    config_manager = ConfigManager()
-    config = config_manager.parse_args()   # parse TOML + CLI
-    trainer = trainer_class(config)         # build everything
-    trainer.train()                        # run training loop
+with open(config) as f:
+    cfg = Config(**(yaml.safe_load(f) or {}))
+train(cfg)
 ```
 
-That's the entire flow. Everything else is details.
+That's all `train.py` does. Typer is the CLI library. `Config` is a pydantic
+model defined in `src/config/config.py`. All real logic lives in
+`src.trainer.train`.
 
----
+Open [`src/trainer.py`](src/trainer.py). The `train()` function is one long
+sequential script — no class, no inheritance. Read it top to bottom. The
+sections are roughly:
 
-## 2. Configuration
+1. **Init** — logging, mutual-exclusion check (quack ↔ compile), build `JobConfig`
+2. **Distributed** — `init_distributed`, build `ParallelDims`, set device
+3. **Model config** — load tokenizer, read its vocab_size, make `model_cfg`
+4. **Dataloader** — `build_text_dataloader` with the batch mesh
+5. **Model** — build on meta device, verify expert/non-expert param split
+6. **Parallelism** — `EP → AC → compile → FSDP`, then `model.to_empty()` + `init_weights()`
+7. **Optimizer, LR scheduler, checkpoint manager**
+8. **Cross-entropy dispatch** — closure captures either `F.cross_entropy` or `quack.cross_entropy`
+9. **Training loop** — grad accum, backward, clip, step, checkpoint, log, eval
 
-### `torchtitan/config/job_config.py`
-All configuration lives here as nested dataclasses. Skim the field names and docstrings — don't memorize values.
+## 3. Config: src/config/config.py
 
-**Key sections and what they control:**
+[`src/config/config.py`](src/config/config.py) is the user-facing config. Every
+field in a YAML file corresponds to an attribute on a pydantic model.
 
-| Dataclass | Controls | Key Fields |
-|-----------|----------|------------|
-| `Job` | Output paths | `dump_folder`, `config_file` |
-| `Model` | Which model to train | `name`, `flavor`, `hf_assets_path` |
-| `Training` | Training hyperparams | `local_batch_size`, `seq_len`, `steps`, `max_norm`, `dataset` |
-| `Optimizer` | Adam/AdamW config | `name`, `lr`, `beta1`, `beta2`, `weight_decay` |
-| `LRScheduler` | LR schedule | `warmup_steps`, `decay_ratio`, `decay_type` |
-| `Parallelism` | How to distribute | `data_parallel_shard_degree`, `tensor_parallel_degree`, `pipeline_parallel_degree` |
-| `Checkpoint` | Save/load behavior | `enable`, `folder`, `interval`, `async_mode` |
-| `Metrics` | Logging | `log_freq`, `enable_wandb` |
-| `Validation` | Periodic eval | `enable`, `freq`, `steps` |
-| `ActivationCheckpoint` | Memory optimization | `mode` (selective/full/none) |
-| `Compile` | torch.compile | `enable`, `components` |
-| `Profiling` | Performance tracing | `enable_profiling`, `enable_memory_snapshot` |
-| `Debug` | Reproducibility | `seed`, `deterministic` |
+Sections (top-level keys):
+- `model` — architecture (layers, dim, heads, experts, etc.)
+- `training` — steps, batch sizes, lr, warmup, precision
+- `parallelism` — dp_shard, ep
+- `data` — tokenizer (HF id or local path), dataset_path
+- `activation_checkpoint`, `compile`, `quack` — optimization toggles
+- `logging` — log_step (how often to print), log_dump (where to write train.log)
+- `eval` — enable, dataset_path, eval_step
+- `checkpoint` — enable, checkpoint_step, checkpoint_dump
 
-**The container:**
-```python
-@dataclass
-class JobConfig:
-    job: Job
-    model: Model
-    training: Training
-    optimizer: Optimizer
-    lr_scheduler: LRScheduler
-    parallelism: Parallelism
-    checkpoint: Checkpoint
-    ...
-```
+At the bottom of the file, `build_job_config(cfg: Config) -> JobConfig`
+translates our pydantic config into TorchTitan's internal `JobConfig`
+dataclass. The reason for this split: TorchTitan's components
+(`CheckpointManager`, optimizer builders, etc.) expect the dataclass form, so
+we keep them untouched and translate at the boundary.
 
-### `torchtitan/config/manager.py`
-Parses configuration from multiple sources with clear precedence:
+The TorchTitan-side dataclasses live in [`src/config/job_config.py`](src/config/job_config.py).
+You mostly never touch this file; it's an implementation detail.
 
-```
-CLI args  >  TOML file  >  dataclass defaults
-```
+## 4. Data: src/data.py
 
-**How it works:**
-1. `_maybe_load_toml()` — finds `--job.config_file` in CLI args, loads the TOML
-2. `_dict_to_dataclass()` — converts TOML dict into JobConfig dataclass (recursive)
-3. `_apply_cli_overrides()` — parses `--section.key value` CLI args, coerces types, applies on top
-4. `_validate_config()` — checks hf_assets_path exists
+[`src/data.py`](src/data.py) has three layers:
 
-**CLI override format:** `--training.steps=100` or `--training.steps 100`
+1. **`load_text_dataset(path)`** — dispatches between `load_from_disk` (for HF
+   `save_to_disk` format) and `load_dataset(path)` (for raw parquet/jsonl).
+2. **`TextDataset`** — wraps an HF dataset, tokenizes and packs samples into
+   fixed-length sequences of `seq_len + 1` tokens, yields `(input, label)`
+   pairs where `label = input[1:]`. Supports both finite and infinite modes.
+3. **`ParallelAwareDataloader`** — thin wrapper over `torchdata.StatefulDataLoader`
+   that remembers each DP rank's state for checkpoint resume.
 
----
+Key detail: each DP rank gets a *different* slice of the dataset via
+`split_dataset_by_node(ds, dp_rank, dp_world_size)`. No rank sees the same
+tokens as another.
 
-## 3. Model Protocol
+`extract_text(sample)` pulls the text field out, trying `text`, `content`,
+`raw_content` in order. If your dataset uses something else, add a case there
+or write a wrapper.
 
-### `torchtitan/protocols/model.py`
-Defines the interface every model must implement:
+## 5. Model: src/models/moe/model.py
 
-```python
-class BaseModelArgs:
-    def update_from_config(self, job_config): ...   # pull training config into model args
-    def get_nparams_and_flops(self, model, seq_len): ...  # for MFU calculation
+[`src/models/moe/model.py`](src/models/moe/model.py) is where the math lives.
+Read it in order:
 
-class ModelProtocol:
-    def __init__(self, model_args): ...
-    def init_weights(self, buffer_device=None): ...      # called after to_empty()
-    def get_attention_masks(self, ...): ...               # optional, for flex/varlen attn
-```
-
-### `torchtitan/protocols/train_spec.py`
-The registration system. A `TrainSpec` is a bag of function pointers that tells the Trainer how to build everything for a given model:
+### 5a. RMSNorm wrapper (lines ~12–40)
 
 ```python
-@dataclass
-class TrainSpec:
-    model_cls               # the nn.Module class
-    model_args              # dict of flavor_name → BaseModelArgs
-    parallelize_fn          # applies TP/FSDP/compile to model
-    pipelining_fn           # optional: sets up pipeline parallel
-    build_optimizers_fn     # creates optimizer(s)
-    build_lr_schedulers_fn  # creates LR scheduler(s)
-    build_dataloader_fn     # creates dataloader
-    build_tokenizer_fn      # creates tokenizer (optional)
-    build_loss_fn           # creates loss function
-    build_validator_fn      # creates validator (optional)
-    state_dict_adapter      # HF checkpoint conversion (optional)
+class RMSNorm(nn.Module):
+    def __init__(self, dim, eps, use_quack=False):
+        ...
+    def forward(self, x):
+        if self.use_quack:
+            from quack import rmsnorm
+            return rmsnorm(x.reshape(-1, x.shape[-1]), self.weight, eps=self.eps).reshape(x.shape)
+        return F.rms_norm(x, (x.shape[-1],), self.weight, self.eps)
 ```
 
-**Model lookup:** `get_train_spec("llama3")` → imports `torchtitan.models.llama3` → calls `get_train_spec()` → returns the wired TrainSpec.
+The `use_quack` flag is threaded through from `cfg.quack.enable` at train-time.
+When True, calls into the QuACK CuTe-DSL kernel for ~speedup on memory-bound
+norms. When False, uses PyTorch's native `F.rms_norm`.
 
-**Why this pattern?** The Trainer doesn't know about any specific model. It only talks to TrainSpec. This lets you add a new model by writing a new module with `get_train_spec()` and registering it.
+### 5b. RoPE (lines ~42–85)
 
----
+Standard complex-number RoPE with `theta=500000` (Llama3/Qwen convention).
+`precompute_freqs_cis` creates the phase table once, and `apply_rotary_emb`
+does the view-as-complex/multiply/view-as-real dance. Called once per
+attention layer during forward.
 
-## 4. A Concrete Model: Llama 3
+### 5c. Attention (lines ~87–135)
 
-### `torchtitan/models/llama3/__init__.py`
-This is where the wiring happens. Read this to see how a model connects to the framework:
+GQA attention (`n_heads` query heads, `n_kv_heads` key/value heads, with
+`n_heads` divisible by `n_kv_heads`). The only non-obvious bit:
 
 ```python
-llama3_args = {
-    "debugmodel": TransformerModelArgs(dim=256, n_layers=6, ...),
-    "8B": TransformerModelArgs(dim=4096, n_layers=32, ...),
-    "70B": ...,
-    "405B": ...,
-}
-
-def get_train_spec() -> TrainSpec:
-    return TrainSpec(
-        model_cls=Transformer,
-        model_args=llama3_args,
-        parallelize_fn=parallelize_llama,           # from ./parallelize.py
-        pipelining_fn=pipeline_llm,                  # from distributed/pipeline_parallel.py
-        build_optimizers_fn=build_optimizers,         # from components/optimizer.py
-        build_lr_schedulers_fn=build_lr_schedulers,   # from components/lr_scheduler.py
-        build_dataloader_fn=build_text_dataloader,    # from hf_datasets/text_datasets.py
-        build_tokenizer_fn=build_hf_tokenizer,        # from components/tokenizer.py
-        build_loss_fn=build_cross_entropy_loss,       # from components/loss.py
-        build_validator_fn=build_validator,            # from components/validate.py
-        state_dict_adapter=Llama3StateDictAdapter,    # from ./state_dict_adapter.py
-    )
+output = flash_attn_func(xq, xk, xv, causal=True)
 ```
 
-### `torchtitan/models/llama3/args.py`
-Model hyperparameters as a dataclass:
+**Why flash_attn directly instead of SDPA?** Two reasons:
+
+1. **FA3-ready**. When flash-attn 3 lands, we swap the function name in one place.
+2. **Native GQA**. `flash_attn_func` handles different head counts for Q vs K/V
+   without us having to call `repeat_kv`. The attention class is ~25 lines
+   shorter than it would be with SDPA.
+
+Tensor layout is `(batch, seqlen, nheads, head_dim)` — no transpose needed
+before calling flash_attn.
+
+### 5d. TransformerBlock (lines ~137–175)
+
+```
+x = x + attention(attention_norm(x), freqs_cis)
+x = x + moe(ffn_norm(x))
+```
+
+Pre-norm, residual connections, standard transformer block. The only layout
+constraint: attributes must be named `attention`, `attention_norm`, `ffn_norm`,
+`moe`, and there must be a `moe_enabled: bool` attribute. The parallelization
+code in `src/models/parallelize.py` inspects these by name.
+
+The `moe` submodule itself is from TorchTitan (`src/models/moe/moe.py`) — we
+build it via `build_moe(args, dim, hidden_dim)`. Important MoE args (from
+`MoEArgs`):
+
+- `num_experts` — total routed experts
+- `top_k` — experts per token
+- `num_shared_experts` — **a single FFN whose hidden_dim is multiplied by this**
+  (not literally N experts; see section 11 below)
+- `score_func` — `"sigmoid"` or `"softmax"` for the router
+- `use_grouped_mm` — use `torch._grouped_mm` for the batched expert computation
+  (needs SM90+)
+- `load_balance_coeff` — auxiliary-loss-free balancing (DeepSeek style)
+
+### 5e. MoETransformer (lines ~177–227)
+
+Top-level model. Has four attributes that `apply_fsdp` relies on by name:
+`tok_embeddings`, `layers` (ModuleDict keyed by `"0"`, `"1"`, ...), `norm`,
+`output`. If you rename any of these, FSDP wrapping breaks.
+
+Forward is trivial: embed → loop over blocks → final norm → output projection.
+
+## 6. Parallelism: src/models/parallelize.py + src/distributed/
+
+[`src/models/parallelize.py`](src/models/parallelize.py) exports two functions:
+
+- **`apply_moe_ep(model, ep_mesh)`** — applies `ExpertParallel` to each
+  `block.moe.experts`, which shards the expert weight matrices along dim 0
+  (expert dim) and injects all-to-all token dispatch/combine around the
+  expert computation.
+- **`apply_fsdp(model, dp_mesh, ...)`** — applies FSDP2 (`fully_shard`) to
+  each block, the embedding, and the head. When `ep_degree > 1`, the expert
+  submodule gets FSDP'd on `edp_mesh` (a separate mesh) and the gradient
+  divide factor is set manually.
+- **`apply_compile(model, ...)`** — wraps each block in `torch.compile`,
+  carefully skipping the expert submodule because its FSDP hooks cause graph
+  breaks.
+
+The order in which `trainer.train` applies these matters:
+
+```
+EP  →  Activation Checkpoint  →  Compile  →  FSDP
+```
+
+(EP first because it shards parameters; AC wraps blocks in
+`checkpoint_wrapper`; compile wraps blocks in `OptimizedModule`; FSDP wraps
+everything last because it needs to see the final module tree.)
+
+The mesh construction itself lives in
+[`src/distributed/parallel_dims.py`](src/distributed/parallel_dims.py). You
+don't usually touch this — `ParallelDims(dp_shard=4, ep=4, ...)` +
+`parallel_dims.build_mesh()` gives you the meshes, and you fetch them by name
+(`parallel_dims.get_mesh("fsdp")`, `get_mesh("ep")`, `get_mesh("batch")`,
+etc.).
+
+For a 4-GPU setup with `dp_shard=4, ep=4`:
+- `fsdp` mesh = all 4 GPUs (for non-expert params)
+- `ep` mesh = all 4 GPUs (experts sharded across them)
+- `efsdp` mesh = size 1 (since `fsdp * tp / (etp * ep) = 4*1/(1*4) = 1`)
+- `batch` mesh = size 4 (for dataloader sharding)
+
+## 7. The training loop proper
+
+Back in [`src/trainer.py`](src/trainer.py), the core of `train()`:
 
 ```python
-@dataclass
-class TransformerModelArgs(BaseModelArgs):
-    dim: int = 4096
-    n_layers: int = 32
-    n_heads: int = 32
-    vocab_size: int = -1       # set from tokenizer
-    max_seq_len: int = 2048    # updated from job_config.training.seq_len
-    rope_theta: float = 500000
-    attn_type: str = "sdpa"    # or "flex", "varlen"
-    ...
-```
+while train_state.step < total_steps:
+    train_state.step += 1
+    step_start = time.perf_counter()
 
-`update_from_config()` pulls `seq_len` from the training config and sets `vocab_size` from the tokenizer.
-
-### `torchtitan/models/llama3/model_def.py`
-The actual transformer. Standard architecture:
-
-```
-Transformer
-  ├── tok_embeddings (nn.Embedding)
-  ├── layers (nn.ModuleDict of TransformerBlock)
-  │     ├── attention_norm (RMSNorm)
-  │     ├── attention (Attention with RoPE)
-  │     ├── ffn_norm (RMSNorm)
-  │     └── feed_forward (SwiGLU FFN: w1, w2, w3)
-  ├── norm (RMSNorm)
-  └── output (nn.Linear)
-```
-
-**Key methods:**
-- `__init__()` — builds all layers
-- `init_weights()` — initializes weights (called after model is moved to device)
-- `forward(tokens)` — embedding → transformer blocks → norm → output logits
-
-**Don't read every line.** Focus on the class structure and `forward()`.
-
----
-
-## 5. Data Pipeline
-
-### `torchtitan/hf_datasets/text_datasets.py`
-How data goes from files to tokens:
-
-```python
-DATASETS = {
-    "c4": DatasetConfig("allenai/c4", "en", "train"),
-    "c4_test": DatasetConfig("tests/assets/c4_test", ...),   # local test data
-}
-```
-
-**`HuggingFaceTextDataset`** — the core dataset class:
-1. Loads dataset via HuggingFace `datasets` library
-2. Tokenizes text samples into token IDs
-3. Buffers tokens and yields fixed-length chunks of `(seq_len + 1)` tokens
-4. Input = first `seq_len` tokens, labels = last `seq_len` tokens (shifted by 1)
-5. Supports infinite looping for training
-6. Stateful — saves buffer position for checkpoint resumption
-
-**`build_text_dataloader()`** wraps the dataset in `ParallelAwareDataloader`.
-
-### `torchtitan/components/dataloader.py`
-Distributed-aware data loading wrapper:
-
-- `ParallelAwareDataloader` — extends `StatefulDataLoader` from torchdata
-- Handles data parallel sharding (each rank gets different data)
-- Stateful for checkpoint resumption (saves per-rank position)
-- Raises `DataloaderExhaustedError` (not `StopIteration`) when data runs out mid-accumulation
-
-### `torchtitan/components/tokenizer.py`
-Loads HuggingFace tokenizers from `tokenizer.json`:
-
-- Auto-detects BOS/EOS tokens from `tokenizer_config.json`
-- Determines if the tokenizer adds BOS/EOS automatically (some do, some don't)
-- `encode()` adds BOS/EOS only if the tokenizer doesn't do it already
-
----
-
-## 6. Loss & Optimization
-
-### `torchtitan/components/loss.py`
-Two key things happen here:
-
-1. **Loss function:** Standard cross-entropy for language modeling
-2. **Gradient accumulation rescaling:** Loss is divided by `gradient_accumulation_steps`
-
-```python
-# Without rescaling: loss would be N times larger with N accumulation steps
-# With rescaling: loss magnitude is independent of accumulation count
-loss_fn = rescale_accumulated_loss(cross_entropy_loss, accumulation_steps)
-```
-
-The `no_rescale()` context manager temporarily disables rescaling during validation.
-
-### `torchtitan/components/optimizer.py`
-Manages one optimizer per model part (needed for pipeline parallelism):
-
-```python
-class OptimizersContainer:
-    # Wraps N optimizers (one per PP stage)
-    # step() calls all of them
-    # state_dict() flattens for resharding compatibility
-```
-
-**`build_optimizers_with_moe_load_balancing()`** — used by DeepSeek V3. Adds a pre-step hook that updates expert routing bias based on token-per-expert statistics. This prevents some experts from being starved of tokens.
-
-### `torchtitan/components/lr_scheduler.py`
-Implements **Warmup-Stable-Decay (WSD)** schedule:
-
-```
-LR
- ^
- |     ___________
- |    /           \
- |   /             \___
- |  /                  \___
- | /                       \
- +--+----------+-------+---→ steps
-    warmup    stable   decay
-```
-
-- **Warmup:** linear 0 → 1
-- **Stable:** constant at peak LR
-- **Decay:** linear, sqrt, or cosine curve down to `min_lr_factor`
-
----
-
-## 7. Training Loop (re-read `train.py` with full context)
-
-Now re-read `Trainer` class in `train.py`. You'll understand every component it references.
-
-### `Trainer.__init__(job_config)`
-Builds everything in this order:
-
-```
-1. Set device (CUDA GPU from LOCAL_RANK)
-2. init_distributed() → create ParallelDims mesh
-3. Set random seeds for reproducibility
-4. get_train_spec(model_name) → get all builders
-5. Build tokenizer
-6. Build dataloader
-7. Build model on meta device (no memory used yet)
-8. Build metrics processor
-9. Calculate param count and FLOPs
-10. Apply parallelism (TP/FSDP/PP) → model moves to real device
-11. Build loss function with accumulation rescaling
-12. Build optimizer and LR scheduler
-13. Initialize CheckpointManager
-14. Build validator (if enabled)
-```
-
-### `Trainer.train()` — the main loop
-
-```python
-def train(self):
-    self.checkpointer.load()           # resume from checkpoint if exists
-
-    with profiling_context:
-        data_iterator = self.batch_generator(self.dataloader)
-
-        while self.step < config.training.steps:
-            self.step += 1
-            self.train_step(data_iterator)     # forward + backward + optimizer
-            self.checkpointer.save(self.step)  # save checkpoint if interval hit
-            self.validator.validate(...)       # validate if freq hit
-```
-
-### `Trainer.train_step(data_iterator)` — one optimizer step
-
-```python
-def train_step(data_iterator):
     optimizers.zero_grad()
+    for _ in range(grad_accum_steps):
+        input_dict, labels = next(data_iter)
+        tokens = input_dict["input"].to(device)
+        labels = labels.to(device)
+        pred = model(tokens)
+        loss = cross_entropy_fn(pred, labels)
+        (loss / grad_accum_steps).backward()
+        accumulated_loss += loss.detach().item() / grad_accum_steps
 
-    # Gradient accumulation: multiple forward-backward before one optimizer step
-    for microbatch in range(gradient_accumulation_steps):
-        input_dict, labels = next(data_iterator)
-        loss = self.forward_backward_step(input_dict, labels)
+    grad_norm = dist_utils.clip_grad_norm_(..., ep_enabled=parallel_dims.ep_enabled)
+    checkpointer.maybe_wait_for_staging()
+    optimizers.step()
+    lr_schedulers.step()
+    train_state.ntokens_seen += tokens_per_step
+    checkpointer.save(step, last_step=(step == total_steps))
 
-    clip_grad_norm_(...)    # prevent exploding gradients
-    optimizers.step()       # update weights
-    lr_schedulers.step()    # update learning rate
-
-    # Log metrics (loss, throughput, MFU, memory)
+    if step % log_step == 0: logger.info(...)
+    if eval_step > 0 and step % eval_step == 0: run_eval(...)
 ```
 
-### `Trainer.forward_backward_step()` — one microbatch
+### Gradient accumulation with FSDP2
 
-```python
-def forward_backward_step(input_dict, labels):
-    if pp_enabled:
-        # Pipeline parallel: pp_schedule handles everything
-        pp_schedule.step(inputs, target=labels, losses=losses)
-    else:
-        # Standard: forward → loss → backward
-        pred = model(inputs)
-        loss = loss_fn(pred, labels)
-        loss.backward()
-    return loss
-```
+We divide `loss` by `grad_accum_steps` and call `.backward()` on each
+microbatch. FSDP2's reduce-scatter happens on every backward, but the
+gradients accumulate into the same `.grad` tensors across microbatches so the
+total is correct. **No `no_sync()` is needed** — that was an FSDP1 pattern.
 
----
+### Gradient clipping with EP
 
-## 8. Metrics & Logging
+`dist_utils.clip_grad_norm_(..., ep_enabled=True)` handles the fact that
+expert parameters live on a smaller mesh than non-expert parameters — their
+gradient norms need to be computed locally then combined correctly.
 
-### `torchtitan/components/metrics.py`
-Collects and logs training metrics:
+## 8. Eval: run_eval()
 
-**What it tracks:**
-- `global_avg_loss`, `global_max_loss` — reduced across all ranks
-- `tps` — tokens per second per device (throughput)
-- `tflops` — teraFLOPs achieved
-- `mfu` — Model FLOPs Utilization (% of hardware peak)
-- `memory` — peak GPU memory usage
-- `lr` — current learning rate
-- `grad_norm` — gradient norm after clipping
+[`src/trainer.py`](src/trainer.py) defines `run_eval` near the top. When
+`cfg.eval.enable=True`, it runs every `cfg.eval.eval_step` training steps:
 
-**MFU formula:** `mfu = 100 * flops_per_token * tokens_per_second / gpu_peak_flops`
+1. `model.eval()`, build a fresh eval dataloader pointing at `cfg.eval.dataset_path`
+2. Loop: `next(iter)` → compute loss + top-1 accuracy → accumulate
+3. **FSDP trap**: all ranks must do the same number of forward passes (because
+   FSDP forward issues collectives). We handle this via
+   `dist.all_reduce(has_batch_flag, op=MIN)` — as soon as any rank runs out of
+   data, all ranks stop together.
+4. Reduce `(loss_sum, correct, tokens)` across the batch mesh
+5. Return `{loss, ppl = exp(loss), top1_acc}`
+6. `model.train()`
 
-**Logging backends:** W&B (via `WandBLogger`) and console (with color formatting).
+No generation metrics (those need autoregressive sampling which is expensive).
+Everything comes from a single teacher-forced forward pass per batch.
 
-### `torchtitan/tools/logging.py`
-Simple logging setup: `init_logger()` configures a StreamHandler with `[titan]` prefix.
+## 9. Checkpoints
 
-### `torchtitan/tools/utils.py`
-Key utilities:
-- `get_peak_flops(device_name)` — lookup table for GPU BF16 peak FLOPS (A100: 312 TFLOPS, H100: 989 TFLOPS, etc.)
-- `GarbageCollection` — disables Python GC and runs it manually at intervals (prevents GC pauses during training)
-- `Color` / `NoColor` — ANSI terminal colors for pretty console output
+We reuse TorchTitan's `CheckpointManager` unchanged. It's a DCP-based
+(`torch.distributed.checkpoint`) system that:
+- Saves sharded state dicts in parallel across ranks
+- Handles resharding on load (if you change `dp_shard`)
+- Supports async staging via pinned memory for near-zero save overhead
 
----
+Our config exposes three knobs:
+- `checkpoint.enable` — master switch
+- `checkpoint.checkpoint_step` — save frequency
+- `checkpoint.checkpoint_dump` — absolute path to save to
 
-## 9. Checkpointing
+The `CheckpointManager` is a no-op if `enable: false` — no folders are
+created, save() is a no-op. Useful for smoke tests.
 
-### `torchtitan/components/checkpoint.py`
-Distributed checkpoint save/load using PyTorch DCP (Distributed Checkpoint):
+State saved: model weights, optimizer state, LR scheduler state,
+`TrainState(step, ntokens_seen)`, and the dataloader position so resuming
+picks up exactly where it left off.
 
-**What gets saved:**
-- Model weights (flattened across PP stages)
-- Optimizer states
-- LR scheduler states
-- Dataloader position (for resumption)
-- Training state (step number, tokens seen)
+## 10. Logging
 
-**Key features:**
-- **Resharding:** Flattened state dicts allow loading with different parallelism config
-- **Async modes:** `disabled` (blocking), `async` (background thread), `async_with_pinned_mem` (pinned memory staging)
-- **HF format:** Can save/load HuggingFace safetensors format via `StateDictAdapter`
-- **Pruning:** Keeps only latest K checkpoints, deletes old ones in background
+[`src/logging.py`](src/logging.py) exports a `logger` object and `init_logger`.
+`logger.info(msg)` goes to **two** places:
 
-**Save flow:**
-```
-Trainer.train() → checkpointer.save(step)
-  → _should_save(step)? (checks interval, last_step)
-  → _flattened_model_states_sd() (merge model parts)
-  → dcp_save() (write to disk, optionally async)
-  → _purge_stale_checkpoints() (delete old ones)
-```
+1. **Console** via `logfire` — rich formatting, can optionally stream to
+   logfire cloud if you set a `LOGFIRE_TOKEN` env var
+2. **File** via Python stdlib `logging.FileHandler` — plain text at
+   `<log_dump>/train.log`
 
-### `torchtitan/protocols/state_dict_adapter.py`
-Interface for converting between native and HuggingFace checkpoint formats:
+`init_logger(log_dir)` attaches the FileHandler, which is why `train()` calls
+it with `cfg.logging.log_dump`.
 
-```python
-class BaseStateDictAdapter:
-    def to_hf(state_dict) → hf_state_dict     # native → HF key mapping
-    def from_hf(hf_state_dict) → state_dict    # HF → native key mapping
-    def get_hf_storage_reader(path)             # for loading HF safetensors
-```
+## 11. MoE internals (read when curious)
 
-Each model (llama3, deepseek_v3) provides its own adapter with model-specific key mappings.
+[`src/models/moe/moe.py`](src/models/moe/moe.py) is imported verbatim from
+TorchTitan and contains:
 
----
+- `MoEArgs` dataclass
+- `MoE` nn.Module (the full routed+shared expert layer)
+- `TokenChoiceTopKRouter` (softmax or sigmoid router with optional group-limited routing)
+- `GroupedExperts` (uses `torch._grouped_mm` for batched expert computation)
+- `TokenReorderer` (permutes tokens by expert assignment before dispatch)
+- Auxiliary-loss-free load balancing via `expert_bias` buffer updated in an
+  optimizer pre-hook
 
-## 10. Validation
+**About `num_shared_experts`**: despite the name, this is *not* N separate
+expert modules. It's a single FFN whose hidden_dim is multiplied by N. Shared
+experts process *every* token (unlike routed experts which only see top_k tokens).
+The intuition: universally-useful features (grammar, basic semantics) go into
+the shared experts, freeing routed experts to specialize.
 
-### `torchtitan/components/validate.py`
-Periodic evaluation during training:
+## 12. Mesh math for the curious
 
-```python
-class Validator:
-    def should_validate(step):
-        return step == 1 or step % freq == 0
-
-    def validate(model_parts, step):
-        for model in model_parts:
-            model.eval()                    # disable dropout
-        with torch.no_grad():
-            for batch in validation_dataloader:
-                loss = forward(batch)       # handles PP if enabled
-            metrics_processor.log_validation(loss, step)
-        for model in model_parts:
-            model.train()                   # re-enable dropout
-```
-
----
-
-## 11. Parallelism Infrastructure
-
-### `torchtitan/distributed/parallel_dims.py`
-The central parallelism abstraction. Creates a multi-dimensional device mesh:
+When you set `dp_shard=4, ep=4, tp=1, pp=1, cp=1` with world_size=4:
 
 ```
-Example: 32 GPUs with TP=4, PP=2, FSDP=4
-
-Mesh dimensions: [pp=2, dp_replicate=1, fsdp=4, tp=4]
-Total: 2 * 1 * 4 * 4 = 32 GPUs
-
-Each dimension has a separate communication group.
+batch         = dp_replicate × dp_shard   = 1 × 4 = 4
+fsdp          = dp_shard × cp             = 4 × 1 = 4
+efsdp         = fsdp × tp / (etp × ep)    = 4 × 1 / (1 × 4) = 1
+ep            = 4 (all GPUs)
 ```
 
-**Key concept:** `build_mesh()` creates overlapping sub-meshes:
-- `dense_mesh` — for non-MoE layers: [pp, dp_replicate, fsdp, tp]
-- `sparse_mesh` — for MoE layers: [pp, dp_replicate, efsdp, ep, etp]
-- `batch_mesh` — for data loading: flattened dp_replicate * fsdp * cp
-- `loss_mesh` — for loss reduction: flattened batch * cp
+Which means:
+- Every GPU gets a different data shard (`batch=4`)
+- Non-expert params are FSDP-sharded across all 4 GPUs (`fsdp=4`)
+- Expert params are EP-sharded (each GPU holds `num_experts / 4` experts) and
+  NOT additionally FSDP-sharded (`efsdp=1`), because there's nothing left to
+  shard after EP took its cut
 
-### `torchtitan/distributed/utils.py`
-Distributed utility functions:
+## 13. When something goes wrong
 
-- `init_distributed()` — initializes process groups, sets timeouts
-- `dist_mean/max/sum()` — all-reduce operations across meshes
-- `clip_grad_norm_()` — gradient clipping that handles PP + EP correctly
-- `set_determinism()` — sets seeds consistently across ranks
-- `create_context_parallel_ctx()` — context manager for sequence splitting in CP
+- **NaN loss** → check that `mixed_precision_param="bfloat16"` and
+  `mixed_precision_reduce="float32"` (the fp32 reduce is critical for MoE
+  stability)
+- **Hang in eval** → check you're using `all_reduce MIN of has_batch`
+  (already done, but if you modify `run_eval`, keep this pattern)
+- **`expected stride 1` in quack backward** → the `_ContiguousGrad` workaround
+  in `cross_entropy_fn` handles this; don't remove it
+- **Mismatched EP correctness** → run `scripts/ep_correctness.sh`; with
+  `force_load_balance=True` the EP=1 and EP=4 losses should match exactly
+  (difference 0.0)
+- **FSDP "parameters still on meta device"** → must call `model.to_empty(device=...)`
+  before `model.init_weights()` when FSDP is applied; we do this in `train()`
 
-### Other distributed files (read when needed):
-- `activation_checkpoint.py` — applies selective or full gradient checkpointing
-- `pipeline_parallel.py` — PP scheduling (splits model into stages)
-- `tensor_parallel.py` — async TP toggle
-- `expert_parallel.py` — EP dispatch/combine for MoE
-- `dual_pipe_v.py` — overlapped PP+EP schedule (advanced)
+## 14. Recommended reading order
 
----
+If you want to read the whole codebase once, go in this order:
 
-## 12. MoE (Mixture of Experts)
+1. [`train.py`](train.py) — 25 lines, the entry point
+2. [`src/config/config.py`](src/config/config.py) — pydantic models + `build_job_config`
+3. [`configs/moe_tiny.yaml`](configs/moe_tiny.yaml) — an actual config
+4. [`src/models/moe/model.py`](src/models/moe/model.py) — Attention → Block → Model
+5. [`src/data.py`](src/data.py) — TextDataset and dataloader
+6. [`src/models/parallelize.py`](src/models/parallelize.py) — apply_moe_ep, apply_fsdp
+7. [`src/trainer.py`](src/trainer.py) — the loop that ties it all together
 
-### `torchtitan/models/moe/moe.py`
-The MoE building blocks used by DeepSeek V3:
-
-```
-Input tokens
-    │
-    ▼
-  Router (linear layer)
-    │ scores each expert
-    ▼
-  Top-K selection
-    │ pick best K experts per token
-    ▼
-  Token dispatch (scatter tokens to experts)
-    │
-    ▼
-  Expert computation (grouped matmul or for-loop)
-    │ each expert is a FeedForward (SwiGLU)
-    ▼
-  Token combine (gather results back)
-    │
-    ▼
-  Output (weighted sum of expert outputs)
-```
-
-**Key classes:**
-- `MoEArgs` — configuration (num_experts, top_k, score_func, load_balance_coeff)
-- `FeedForward` — single expert (or shared expert) with SwiGLU
-- `GroupedExperts` — batched expert computation
-- `MoE` — full MoE layer with router, experts, optional shared experts
-- `build_moe()` — factory function
-
-### `torchtitan/models/deepseek_v3/__init__.py`
-DeepSeek V3 differs from Llama 3 in two ways:
-1. Uses MoE layers (some layers are dense, some are MoE)
-2. Uses `build_optimizers_with_moe_load_balancing` for expert bias updates
-
----
-
-## Data Flow Diagram
-
-```
-run_train.sh
-    │
-    ▼
-ConfigManager.parse_args()
-    │ TOML + CLI → JobConfig
-    ▼
-get_train_spec("llama3")
-    │ → TrainSpec with all builders
-    ▼
-Trainer.__init__()
-    │
-    ├── build tokenizer ← tokenizer.json
-    ├── build dataloader ← HuggingFace dataset → tokenize → chunk
-    ├── build model (meta) → parallelize (TP/FSDP/PP) → init_weights
-    ├── build loss_fn → wrap with accumulation rescaling
-    ├── build optimizer(s) → one per PP stage
-    ├── build lr_scheduler(s)
-    ├── build CheckpointManager
-    └── build Validator
-    │
-    ▼
-Trainer.train()
-    │
-    ├── load checkpoint (if resuming)
-    │
-    └── for step in 1..N:
-            │
-            ├── train_step():
-            │     ├── zero_grad
-            │     ├── for microbatch in accumulation_steps:
-            │     │     ├── get batch from dataloader
-            │     │     ├── forward pass → logits
-            │     │     ├── loss = cross_entropy(logits, labels) / accum_steps
-            │     │     └── loss.backward()
-            │     ├── clip_grad_norm
-            │     ├── optimizer.step()
-            │     └── lr_scheduler.step()
-            │
-            ├── log metrics (loss, throughput, MFU, memory)
-            ├── save checkpoint (if interval)
-            └── validate (if freq)
-```
-
----
-
-## File Index
-
-| File | Lines | What to Look For |
-|------|-------|-----------------|
-| `train.py` | 721 | `Trainer.__init__`, `train()`, `train_step()`, `forward_backward_step()` |
-| `config/job_config.py` | 780 | All the `@dataclass` definitions — skim field names |
-| `config/manager.py` | 304 | `parse_args()`, `_apply_cli_overrides()`, `_coerce_value()` |
-| `protocols/model.py` | 62 | `BaseModelArgs`, `ModelProtocol` |
-| `protocols/train_spec.py` | 76 | `TrainSpec` dataclass, `get_train_spec()` |
-| `models/llama3/__init__.py` | 110 | `llama3_args` dict, `get_train_spec()` wiring |
-| `models/llama3/args.py` | 63 | `TransformerModelArgs` fields |
-| `models/llama3/model_def.py` | 580 | `Transformer` class structure, `forward()` |
-| `models/llama3/parallelize.py` | 310 | `parallelize_llama()` — how TP/FSDP/compile are applied |
-| `models/deepseek_v3/__init__.py` | 166 | MoE model args with `MoEArgs` |
-| `models/moe/moe.py` | 572 | `MoE` class, `GroupedExperts`, routing logic |
-| `models/parallelize.py` | 390 | `apply_fsdp()`, `apply_moe_ep_tp()` — shared MoE parallelization |
-| `hf_datasets/text_datasets.py` | 247 | `HuggingFaceTextDataset.__iter__()` — token chunking |
-| `components/dataloader.py` | 133 | `ParallelAwareDataloader` — distributed data loading |
-| `components/tokenizer.py` | 155 | `HuggingFaceTokenizer` — BOS/EOS inference |
-| `components/loss.py` | 74 | `rescale_accumulated_loss()` — why loss is divided by accum steps |
-| `components/optimizer.py` | 346 | `OptimizersContainer`, MoE load balancing hook |
-| `components/lr_scheduler.py` | 186 | WSD schedule implementation |
-| `components/metrics.py` | 485 | `MetricsProcessor.log()` — what metrics are tracked |
-| `components/checkpoint.py` | 725 | `CheckpointManager.save()` / `load()` |
-| `components/validate.py` | 215 | `Validator.validate()` |
-| `distributed/parallel_dims.py` | 363 | `ParallelDims.build_mesh()` — mesh creation |
-| `distributed/utils.py` | 532 | `init_distributed()`, `clip_grad_norm_()` |
-| `tools/utils.py` | 208 | `get_peak_flops()`, `GarbageCollection` |
-| `tools/profiling.py` | 141 | `maybe_enable_profiling()` — optional, skim |
+Optional deep-dives:
+- [`src/models/moe/moe.py`](src/models/moe/moe.py) — MoE internals (torchtitan)
+- [`src/distributed/parallel_dims.py`](src/distributed/parallel_dims.py) — mesh construction
+- [`src/components/checkpoint.py`](src/components/checkpoint.py) — DCP checkpointing
+- [`scripts/ep_correctness.py`](scripts/ep_correctness.py) — how we verify EP numerically

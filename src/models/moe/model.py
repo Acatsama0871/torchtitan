@@ -8,7 +8,6 @@ from torch import nn
 from src.config.config import ModelConfig
 from src.models.moe import FeedForward, build_moe
 
-
 # --- RMSNorm ---
 
 
@@ -116,7 +115,9 @@ class TransformerBlock(nn.Module):
         from src.models.moe import MoEArgs
 
         self.attention = Attention(cfg.dim, cfg.n_heads, cfg.n_kv_heads, cfg.head_dim)
-        self.attention_norm = RMSNorm(cfg.dim, eps=cfg.norm_eps, use_quack=cfg.use_quack)
+        self.attention_norm = RMSNorm(
+            cfg.dim, eps=cfg.norm_eps, use_quack=cfg.use_quack
+        )
         self.ffn_norm = RMSNorm(cfg.dim, eps=cfg.norm_eps, use_quack=cfg.use_quack)
 
         self.moe_enabled = layer_id >= cfg.n_dense_layers
@@ -137,7 +138,7 @@ class TransformerBlock(nn.Module):
         else:
             self.feed_forward = FeedForward(cfg.dim, cfg.ffn_dim)
 
-        if cfg.depth_init:
+        if cfg.depth_init:  # ? the accumulated variance of the residual stream stays bounded regardless of depth
             self.weight_init_std = 0.02 / (2 * (layer_id + 1)) ** 0.5
         else:
             self.weight_init_std = 0.02 / (2 * cfg.n_layers) ** 0.5
@@ -183,7 +184,7 @@ class MoETransformer(nn.Module):
             if hasattr(cfg, "max_seq_len")
             else precompute_freqs_cis(cfg.head_dim, 8192, cfg.rope_theta),
             persistent=False,
-        )
+        )  # ? notice the buffer is computed twice here and init weight function. it is called here for meta device initializtion. No actual data is saved.
 
         self.layers = nn.ModuleDict()
         for layer_id in range(cfg.n_layers):
@@ -210,7 +211,7 @@ class MoETransformer(nn.Module):
         final_out_std = self.cfg.dim**-0.5
         cutoff_factor = 3
         if self.output is not None:
-            nn.init.trunc_normal_(
+            nn.init.trunc_normal_(  # ? using trunc_normal to avoid large initial logits which can destabilize training, the output has the dimension of vocab size
                 self.output.weight,
                 mean=0.0,
                 std=final_out_std,

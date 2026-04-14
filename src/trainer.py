@@ -13,7 +13,11 @@ from torch.distributed.checkpoint.stateful import Stateful
 from src.components.checkpoint import CheckpointManager
 from src.components.lr_scheduler import build_lr_schedulers
 from src.components.optimizer import build_optimizers_with_moe_load_balancing
-from src.components.tokenizer import BaseTokenizer, HuggingFaceTokenizer, resolve_tokenizer_path
+from src.components.tokenizer import (
+    BaseTokenizer,
+    HuggingFaceTokenizer,
+    resolve_tokenizer_path,
+)
 from src.config import TORCH_DTYPE_MAP
 from src.config.config import Config, build_job_config
 from src.data import DataloaderExhaustedError, build_text_dataloader
@@ -134,72 +138,78 @@ def run_eval(
 
 def train(cfg: Config):
     """Run MoE model training from a resolved Config."""
-    init_logger(log_dir=cfg.logging.log_dump)
+    init_logger(log_dir=cfg.logging.log_dump)  # * ✓
 
     # quack and compile are mutually exclusive: CuTe-DSL kernels are opaque to Dynamo
-    if cfg.quack.enable and cfg.compile.enable:
+    if cfg.quack.enable and cfg.compile.enable:  # * ✓
         raise ValueError(
             "quack.enable and compile.enable are mutually exclusive: "
             "QuACK kernels cannot be traced by torch.compile"
         )
 
-    job_config = build_job_config(cfg)
+    job_config = build_job_config(cfg)  # * ✓
 
     # Init distributed
-    world_size = dist_utils.init_distributed(job_config.comm)
+    world_size = dist_utils.init_distributed(job_config.comm)  # * ✓
     parallel_dims = ParallelDims(
         dp_replicate=1,
         dp_shard=cfg.parallelism.dp_shard,
-        cp=1, tp=1, pp=1,
+        cp=1,
+        tp=1,
+        pp=1,
         ep=cfg.parallelism.ep,
         etp=1,
         world_size=world_size,
-    )
-    parallel_dims.build_mesh()
+    )  # * ✓
+    parallel_dims.build_mesh()  # * ✓
 
     # Device and seeds
-    device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
-    torch.cuda.set_device(device)
+    device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")  # * ✓
+    torch.cuda.set_device(device)  # * ✓
+    # ? the seed used here is set in training
     dist_utils.set_determinism(
-        parallel_dims, device, job_config.debug, distinct_seed_mesh_dims=[]
-    )
+        parallel_dims,
+        device,
+        job_config.debug,
+        distinct_seed_mesh_dims=[],  # ? note the distict seed is empty because we did not use pp here.
+    )  # * ✓
 
     # Tokenizer
-    tokenizer_path = resolve_tokenizer_path(cfg.data.tokenizer)
-    tokenizer = HuggingFaceTokenizer(tokenizer_path)
+    tokenizer_path = resolve_tokenizer_path(cfg.data.tokenizer)  # * ✓
+    tokenizer = HuggingFaceTokenizer(tokenizer_path)  # * ✓
 
     # Model config: seq_len for RoPE, vocab_size from tokenizer (unless pinned), quack flag
-    vocab_size = cfg.model.vocab_size or tokenizer.get_vocab_size()
+    vocab_size = cfg.model.vocab_size or tokenizer.get_vocab_size()  # * ✓
     if cfg.model.vocab_size is None:
-        logger.info(f"Auto-detected vocab_size={vocab_size} from tokenizer")
+        logger.info(f"Auto-detected vocab_size={vocab_size} from tokenizer")  # * ✓
     model_cfg = cfg.model.model_copy(
         update={
             "max_seq_len": cfg.training.seq_len,
             "vocab_size": vocab_size,
             "use_quack": cfg.quack.enable,
         }
-    )
+    )  # * ✓
 
     # Dataloader
-    batch_mesh = parallel_dims.get_optional_mesh("batch")
+    batch_mesh = parallel_dims.get_optional_mesh("batch")  # * ✓
     if batch_mesh is not None:
-        dp_world_size = batch_mesh.size()
-        dp_rank = batch_mesh.get_local_rank()
+        dp_world_size = batch_mesh.size()  # * ✓
+        dp_rank = batch_mesh.get_local_rank()  # * ✓
     else:
-        dp_world_size = 1
-        dp_rank = 0
+        dp_world_size = 1  # * ✓
+        dp_rank = 0  # * ✓
     dataloader = build_text_dataloader(
         dp_world_size=dp_world_size,
         dp_rank=dp_rank,
         tokenizer=tokenizer,
         job_config=job_config,
-    )
+    )  # * ✓
 
     # Gradient accumulation
-    grad_accum_steps = cfg.training.grad_accum_steps
+    grad_accum_steps = cfg.training.grad_accum_steps  # * ✓
     global_batch_size = (
         cfg.training.local_batch_size * dp_world_size * grad_accum_steps
-    )
+    )  # * ✓
 
     # Build model on meta device
     logger.info(
@@ -207,7 +217,7 @@ def train(cfg: Config):
         f"{cfg.model.num_experts} experts, top_k={cfg.model.top_k}"
     )
     with torch.device("meta"):
-        model = MoETransformer(model_cfg)
+        model = MoETransformer(model_cfg)  # * ✓
 
     # Verify param groups
     expert_params = sum(
@@ -225,7 +235,7 @@ def train(cfg: Config):
 
     # Parallelism: EP → AC → compile → FSDP (order matters)
     if parallel_dims.ep_enabled:
-        apply_moe_ep(model, parallel_dims.get_mesh("ep"))
+        apply_moe_ep(model, parallel_dims.get_mesh("ep"))  # * ✓
 
     compile_enabled = cfg.compile.enable
     if job_config.activation_checkpoint.mode != "none":
@@ -243,7 +253,9 @@ def train(cfg: Config):
     if compile_enabled:
         from src.models.parallelize import apply_compile
 
-        apply_compile(model, backend=cfg.compile.backend, ep_enabled=parallel_dims.ep_enabled)
+        apply_compile(
+            model, backend=cfg.compile.backend, ep_enabled=parallel_dims.ep_enabled
+        )  # * ✓
 
     if parallel_dims.fsdp_enabled or parallel_dims.ep_enabled:
         apply_fsdp(
@@ -254,19 +266,19 @@ def train(cfg: Config):
             ep_degree=cfg.parallelism.ep,
             edp_mesh=parallel_dims.get_optional_mesh("efsdp"),
             gradient_divide_factor=parallel_dims.fsdp_gradient_divide_factor,
-        )
+        )  # * ✓
 
-    model.to_empty(device=device)
-    model.init_weights(buffer_device=device)
-    model.train()
+    model.to_empty(device=device)  # * ✓
+    model.init_weights(buffer_device=device)  # * ✓
+    model.train()  # * ✓
 
     # Optimizer, LR scheduler, checkpoint
     optimizers = build_optimizers_with_moe_load_balancing(
         [model], job_config.optimizer, parallel_dims
-    )
+    )  # * ✓
     lr_schedulers = build_lr_schedulers(
         optimizers, job_config.lr_scheduler, cfg.training.max_steps
-    )
+    )  # * ✓
     train_state = TrainState()
     checkpointer = CheckpointManager(
         dataloader=dataloader,
@@ -313,16 +325,17 @@ def train(cfg: Config):
                 return x
 
             @staticmethod
-            def backward(ctx, grad_output):
+            def backward(ctx, grad_output):  # type: ignore
                 return grad_output.contiguous()
 
-        def cross_entropy_fn(pred, labels):
+        def cross_entropy_fn(pred, labels):  # type: ignore
             pred_flat = pred.flatten(0, 1).float()
             labels_flat = labels.flatten(0, 1)
             per_token = quack_cross_entropy(pred_flat, labels_flat, reduction="none")
             per_token = _ContiguousGrad.apply(per_token)
             return per_token.mean()
     else:
+
         def cross_entropy_fn(pred, labels):
             return F.cross_entropy(pred.flatten(0, 1).float(), labels.flatten(0, 1))
 
